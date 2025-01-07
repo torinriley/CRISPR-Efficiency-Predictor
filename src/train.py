@@ -1,73 +1,139 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from model import one_hot_encode, encode_epigenetic_features, build_crispr_model
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import csv
+import os
+from model import CRISPRModel
 
-file_path = "data/data.csv"  
-columns = ["Chrom", "Start", "End", "Strand", "Target Seq", "CTCF", "Dnase", "H3K4me3", "RRBS", "Score"]
-data = pd.read_csv(file_path, sep="\t", names=columns)
+class CRISPRDatasetCSV(Dataset):
+    def __init__(self, csv_path, max_len=23):
+        """
+        Initializes the dataset by loading data from a CSV file.
+        :param csv_path: Path to the CSV file.
+        :param max_len: Maximum sequence length for DNA sequences and epigenetic features.
+        """
+        self.data = self.load_csv(csv_path)
+        self.max_len = max_len
 
-print(f"Dataset loaded with {len(data)} rows.")
+    def load_csv(self, csv_path):
+        """
+        Loads the data from a CSV file.
+        :param csv_path: Path to the CSV file.
+        :return: List of data entries (each entry is a dictionary with DNA sequence, epigenetic features, and label).
+        """
+        data = []
+        with open(csv_path, "r") as f:
+            reader = csv.reader(f, delimiter="\t")
+            next(reader) 
+            for row in reader:
+                if len(row) >= 10:
+                    dna_sequence = row[4] 
+                    epigenetic_features = ''.join(row[5:9])  
+                    try:
+                        label = float(row[9]) 
+                        data.append({
+                            "dna_sequence": dna_sequence,
+                            "epigenetic_features": epigenetic_features,
+                            "label": label
+                        })
+                    except ValueError:
+                        print(f"Skipping row with invalid label: {row}")
+                else:
+                    print(f"Skipping row with insufficient columns: {row}")
+        return data
 
-print("One-hot encoding DNA sequences...")
-sequence_input = np.array([one_hot_encode(seq) for seq in data['Target Seq']])
+    def one_hot_encode(self, sequence):
+        """
+        One-hot encodes a DNA sequence.
+        :param sequence: DNA sequence (string)
+        :return: List of one-hot encoded arrays
+        """
+        mapping = {'A': [1, 0, 0, 0], 'C': [0, 1, 0, 0], 'G': [0, 0, 1, 0], 'T': [0, 0, 0, 1]}
+        return [mapping.get(base, [0, 0, 0, 0]) for base in sequence]
 
-print("Encoding epigenetic features...")
-epigenetic_input = np.array([
-    np.hstack([
-        encode_epigenetic_features(row['CTCF']),
-        encode_epigenetic_features(row['Dnase']),
-        encode_epigenetic_features(row['H3K4me3']),
-        encode_epigenetic_features(row['RRBS'])
-    ])
-    for _, row in data.iterrows()
-])
+    def encode_epigenetic_features(self, features):
+        """
+        Encodes epigenetic feature sequence ('A' -> 1, 'N' -> 0).
+        :param features: String of 'A' and 'N' characters
+        :return: List of binary values
+        """
+        return [1 if char == 'A' else 0 for char in features]
 
-target = data['Score'].values
+    def __len__(self):
+        return len(self.data)
 
-print(f"Sequence input shape: {sequence_input.shape}")
-print(f"Epigenetic input shape: {epigenetic_input.shape}")
-print(f"Target shape: {target.shape}")
+    def __getitem__(self, idx):
+        entry = self.data[idx]
+        dna_sequence = entry["dna_sequence"]
+        epigenetic_features = entry["epigenetic_features"]
+        label = entry["label"]
 
-print("Splitting data into training and testing sets...")
-seq_train, seq_test, epi_train, epi_test, y_train, y_test = train_test_split(
-    sequence_input, epigenetic_input, target, test_size=0.2, random_state=42
-)
+        dna_encoded = self.one_hot_encode(dna_sequence)
+        dna_encoded = dna_encoded[:self.max_len]
+        while len(dna_encoded) < self.max_len: 
+            dna_encoded.append([0, 0, 0, 0])
 
-print(f"Training set: {seq_train.shape}, {epi_train.shape}, {y_train.shape}")
-print(f"Testing set: {seq_test.shape}, {epi_test.shape}, {y_test.shape}")
+        epi_encoded = self.encode_epigenetic_features(epigenetic_features)
+        epi_encoded = epi_encoded[:self.max_len]
+        while len(epi_encoded) < self.max_len: 
+            epi_encoded.append(0)
 
-seq_length = sequence_input.shape[1]
-num_epigenetic_features = epigenetic_input.shape[1]
+        dna_tensor = torch.tensor(dna_encoded, dtype=torch.float32)
+        epi_tensor = torch.tensor(epi_encoded, dtype=torch.float32)
+        label_tensor = torch.tensor(label, dtype=torch.float32)
 
-print("Building model...")
-model = build_crispr_model((seq_length, 4), (num_epigenetic_features,))
+        return dna_tensor, epi_tensor, label_tensor
 
-print("Training the model...")
-history = model.fit(
-    [seq_train, epi_train], y_train,
-    validation_split=0.2,
-    epochs=10, 
-    batch_size=16,
-    verbose=1
-)
+def train_model(model, train_loader, criterion, optimizer, device, epochs=10, checkpoints_dir="checkpoints"):
+    model.to(device)
+    os.makedirs(checkpoints_dir, exist_ok=True)
 
-print("Evaluating the model on the test set...")
-loss, mae = model.evaluate([seq_test, epi_test], y_test)
-print(f"Test Loss: {loss:.4f}, Test MAE: {mae:.4f}")
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
 
-model.save("models/crispr_model.h5")
-print("Model saved as 'crispr_model.h5'.")
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
 
-import matplotlib.pyplot as plt
+        for dna_batch, epi_batch, labels in progress_bar:
+            dna_batch, epi_batch, labels = dna_batch.to(device), epi_batch.to(device), labels.to(device)
 
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Training and Validation Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-plt.savefig("training_loss_plot.png")
-plt.show()
+            outputs = model(dna_batch, epi_batch)
+            loss = criterion(outputs.squeeze(), labels)
 
-print("Training complete. Results saved.")
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            progress_bar.set_postfix(loss=loss.item())
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+
+        checkpoint_path = os.path.join(checkpoints_dir, f"crispr_model_epoch_{epoch + 1}.pth")
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Model checkpoint saved at {checkpoint_path}")
+
+seq_length = 23
+num_epigenetic_features = 4 * seq_length
+batch_size = 32
+epochs = 10
+learning_rate = 0.001
+
+dataset_path = "data/data.csv"
+dataset = CRISPRDatasetCSV(dataset_path, max_len=seq_length)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+model = CRISPRModel(seq_input_shape=(seq_length, 4), epigenetic_input_shape=num_epigenetic_features)
+criterion = nn.MSELoss() 
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+train_model(model, dataloader, criterion, optimizer, device, epochs)
+
+
+torch.save(model.state_dict(), "crispr_model_final.pth")
+print("Final model saved as 'crispr_model_final.pth'")

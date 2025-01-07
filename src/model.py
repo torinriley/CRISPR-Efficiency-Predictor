@@ -1,56 +1,60 @@
-import numpy as np
-from tensorflow.keras.layers import Input, Conv1D, MaxPooling1D, Flatten, Dense, Dropout, concatenate
-from tensorflow.keras.models import Model
+import torch
+import torch.nn as nn
 
-def one_hot_encode(sequence):
-    """
-    One-hot encodes a DNA sequence.
-    :param sequence: DNA sequence (string)
-    :return: Numpy array of one-hot encoded sequence
-    """
-    mapping = {'A': [1, 0, 0, 0], 'C': [0, 1, 0, 0], 'G': [0, 0, 1, 0], 'T': [0, 0, 0, 1]}
-    return np.array([mapping.get(base, [0, 0, 0, 0]) for base in sequence]) 
+class CRISPRModel(nn.Module):
+    def __init__(self, seq_input_shape, epigenetic_input_shape):
+        """
+        Initializes the CRISPR model.
+        :param seq_input_shape: Tuple (seq_length, num_channels) for DNA sequences.
+        :param epigenetic_input_shape: Number of epigenetic features.
+        """
+        super(CRISPRModel, self).__init__()
 
-def encode_epigenetic_features(epigenetic_seq):
-    """
-    Encodes epigenetic feature sequence ('A' -> 1, 'N' -> 0).
-    :param epigenetic_seq: String of 'A' and 'N' characters
-    :return: List of binary values
-    """
-    return [1 if char == 'A' else 0 for char in epigenetic_seq]
+        self.seq_conv = nn.Conv1d(
+            in_channels=seq_input_shape[1],
+            out_channels=64,
+            kernel_size=3,
+            padding=1
+        )
+        self.seq_pool = nn.MaxPool1d(kernel_size=2)
 
-def build_crispr_model(sequence_input_shape, epigenetic_input_shape):
-    """
-    Builds the multi-input model for CRISPR prediction.
-    :param sequence_input_shape: Tuple (sequence_length, 4) for one-hot encoded DNA sequences
-    :param epigenetic_input_shape: Tuple (number_of_epigenetic_features,) for encoded epigenetic features
-    :return: Compiled Keras model
-    """
-    seq_input = Input(shape=sequence_input_shape, name="sequence_input")
-    seq_branch = Conv1D(filters=32, kernel_size=3, activation='relu')(seq_input)
-    seq_branch = MaxPooling1D(pool_size=2)(seq_branch)
-    seq_branch = Flatten()(seq_branch)
+        self.epi_fc = nn.Linear(epigenetic_input_shape, 64)
 
-    epi_input = Input(shape=epigenetic_input_shape, name="epigenetic_input")
-    epi_branch = Dense(64, activation='relu')(epi_input)
-    epi_branch = Dropout(0.5)(epi_branch)
+        seq_output_size = (seq_input_shape[0] // 2) * 64  
+        self.fc = nn.Linear(64 + seq_output_size, 1)
+        seq_output_size = (seq_input_shape[0] // 2 + seq_input_shape[0] % 2) * 64  
+    def forward(self, seq_input, epi_input):
+        """
+        Forward pass for the model.
+        :param seq_input: Tensor of shape (batch_size, seq_length, num_channels)
+        :param epi_input: Tensor of shape (batch_size, num_epigenetic_features)
+        :return: Output tensor of shape (batch_size, 1)
+        """
+        seq_output = self.seq_conv(seq_input.permute(0, 2, 1))  # Change to (batch_size, channels, seq_length)
+        seq_output = torch.relu(seq_output)
+        seq_output = self.seq_pool(seq_output)  
+        seq_output = seq_output.view(seq_output.size(0), -1) 
 
-    combined = concatenate([seq_branch, epi_branch])
-    combined = Dense(64, activation='relu')(combined)
-    combined = Dropout(0.5)(combined)
-    output = Dense(1, activation='linear', name="output")(combined)
+        epi_output = torch.relu(self.epi_fc(epi_input))
 
-    model = Model(inputs=[seq_input, epi_input], outputs=output)
-    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+        combined = torch.cat((seq_output, epi_output), dim=1)
 
-    return model
+        output = self.fc(combined)
+        return output
 
 if __name__ == "__main__":
     seq_length = 23 
     num_epigenetic_features = 4 * seq_length  
 
     seq_shape = (seq_length, 4)
-    epi_shape = (num_epigenetic_features,) 
+    epi_shape = num_epigenetic_features
 
-    model = build_crispr_model(seq_shape, epi_shape)
-    model.summary()
+    model = CRISPRModel(seq_input_shape=seq_shape, epigenetic_input_shape=epi_shape)
+    print(model)
+
+    batch_size = 16
+    seq_input = torch.rand(batch_size, seq_shape[0], seq_shape[1])  # (batch_size, seq_length, 4)
+    epi_input = torch.rand(batch_size, epi_shape)  # (batch_size, num_epigenetic_features)
+
+    output = model(seq_input, epi_input)
+    print(f"Output shape: {output.shape}")  # Should be (batch_size, 1)
